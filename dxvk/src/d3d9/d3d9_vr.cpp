@@ -142,33 +142,62 @@ namespace dxvk {
         HRESULT STDMETHODCALLTYPE WaitDeviceIdle()
         {
             m_device->Flush();
-            // Not clear if we need all here, perhaps...
             m_device->SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
-            m_device->GetDXVKDevice()->waitForIdle();
+            const auto device = m_device->GetDXVKDevice();
+            device->lockSubmission();
+            const VkResult result = device->vkd()->vkDeviceWaitIdle(device->handle());
+            device->unlockSubmission();
+            if (result != VK_SUCCESS) return D3DERR_DEVICELOST;
+            m_backBufferImages.Drained();
             return D3D_OK;
+        }
+
+        void STDMETHODCALLTYPE LockSubmissionQueue() { m_device->GetDXVKDevice()->lockSubmission(); }
+        void STDMETHODCALLTYPE UnlockSubmissionQueue() { m_device->GetDXVKDevice()->unlockSubmission(); }
+        void STDMETHODCALLTYPE ReleaseRuntimeLease() { m_openVRSession.Reset(); }
+
+        void STDMETHODCALLTYPE DiscardBackBufferAfterDrain()
+        {
+            // Called only after consumer detachment and a successful queue drain.
+            InvalidateBackBufferData();
+            m_backBufferImages.ClearAfterDrain();
+            m_diagnostics.NewGeneration();
         }
 
         HRESULT STDMETHODCALLTYPE CaptureBackBufferData()
         {
             const auto lock = m_device->LockDevice();
-            InvalidateBackBufferData();
+            m_backBufferCaptureStarted = true;
+            m_hasBackBufferData = false;
+            m_backBufferDesc = {};
             IDirect3DSurface9* surface = nullptr;
             HRESULT result = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &surface);
             if (FAILED(result) || !surface) {
                 if (surface)
                     surface->Release();
-                return FAILED(result) ? result : D3DERR_INVALIDCALL;
+                return RecordCaptureResult(FAILED(result) ? result : D3DERR_INVALIDCALL, {});
             }
 
             auto* texture = static_cast<D3D9Surface*>(surface)->GetCommonTexture();
-            result = GetVRDesc(surface, &m_backBufferDesc);
+            D3D9_TEXTURE_VR_DESC capturedDesc{};
+            result = GetVRDesc(surface, &capturedDesc);
             if (SUCCEEDED(result)) {
-                m_backBufferImage = texture->Desc()->MultiSample != D3DMULTISAMPLE_NONE
+                const auto image = texture->Desc()->MultiSample != D3DMULTISAMPLE_NONE
                     ? texture->GetResolveImage() : texture->GetImage();
-                m_hasBackBufferData = true;
+                Game* const game = g_Game.load(std::memory_order_acquire);
+                // A bound menu texture can outlive HideOverlay. Detach it before
+                // the existing Present drain retires a different captured image.
+                const bool detached = image == m_backBufferImages.Current() || !game || !game->m_VR ||
+                    !game->m_VR->OwnsD3DDevice(m_device) || game->m_VR->DetachBackBufferOverlay(false);
+                if (detached && m_backBufferImages.Replace(image)) {
+                    m_backBufferDesc = capturedDesc;
+                    m_hasBackBufferData = true;
+                } else {
+                    result = D3DERR_INVALIDCALL;
+                }
             }
             surface->Release();
-            return result;
+            return RecordCaptureResult(result, capturedDesc);
         }
 
         void STDMETHODCALLTYPE InvalidateBackBufferData()
@@ -176,7 +205,8 @@ namespace dxvk {
             const auto lock = m_device->LockDevice();
             m_backBufferCaptureStarted = true;
             m_hasBackBufferData = false;
-            m_backBufferImage = nullptr;
+            // Invalidation makes the descriptor unusable, but does not free an
+            // image that an overlay or queued runtime copy might still reference.
             m_backBufferDesc = {};
         }
 
@@ -215,13 +245,25 @@ namespace dxvk {
         }
 
     private:
+        HRESULT RecordCaptureResult(HRESULT result, const D3D9_TEXTURE_VR_DESC& desc)
+        {
+            Game* const game = g_Game.load(std::memory_order_acquire);
+            m_diagnostics.SetVerbose(game && game->m_VR && game->m_VR->m_Config.verboseDiagnostics, GetTickCount64());
+            if (m_diagnostics.Observe(RenderCondition::BackBufferCapture, FAILED(result),
+                    {static_cast<std::uint32_t>(result), static_cast<std::uint32_t>(desc.Format), desc.Width, desc.Height, desc.SampleCount}, true)
+                    != RenderConditionChange::None)
+                Logger::info(str::format("Portal2VR back buffer capture: hr=", result, " format=", desc.Format,
+                    " size=", desc.Width, "x", desc.Height, " samples=", desc.SampleCount));
+            return result;
+        }
         D3D9DeviceEx *m_device;
         Portal2VROpenVR::SessionLease m_openVRSession;
         D3D9DeviceLock m_lock;
-        Rc<DxvkImage> m_backBufferImage;
+        CapturedImageRetention<Rc<DxvkImage>> m_backBufferImages;
         D3D9_TEXTURE_VR_DESC m_backBufferDesc{};
         bool m_hasBackBufferData = false;
         bool m_backBufferCaptureStarted = false;
+        RenderConditionDiagnostics m_diagnostics;
     };
 
 }

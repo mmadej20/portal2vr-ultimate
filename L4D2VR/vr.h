@@ -11,6 +11,8 @@
 #include "haptics.h"
 #include "render_diagnostics.h"
 #include "render_target_readiness.h"
+#include "vr_resource_lifecycle.h"
+#include "render_condition_diagnostics.h"
 #include "menu_overlay_placement.h"
 #include "muzzle_origin.h"
 #include "openvr_session.h"
@@ -51,7 +53,11 @@ public:
     IDirect3DDevice9 *m_D3DDevice = nullptr;
     IDirect3DVR9 *m_D3DVR = nullptr;
     bool OwnsD3DDevice(const IDirect3DDevice9 *device) const { return m_D3DDevice == device; }
-    void InvalidateD3DResources();
+    bool InvalidateD3DResources(bool deviceReset = true);
+    bool DetachBackBufferOverlay(bool hide = true);
+    bool RefreshBackBuffer(SharedTextureHolder& holder);
+    void InvalidateTrackingOutput();
+    void SuspendInputForRenderFailure();
 
 	vr::IVRSystem *m_System = nullptr;
 	vr::IVRInput *m_Input = nullptr;
@@ -64,7 +70,6 @@ public:
 	bool m_WorldAimMarkerLogged = false;
 	bool m_WorldAimMarkerCadenceLogged = false;
 	std::chrono::steady_clock::time_point m_LastWorldAimMarkerUpdate{};
-	std::chrono::steady_clock::time_point m_NextHUDOverlayErrorLog{};
 	bool m_HUDCaptureLogged = false;
 	unsigned m_HUDMissingCaptureFrames = 0;
 	UiInput::MenuPointerState m_MenuPointerState;
@@ -202,6 +207,8 @@ public:
 	bool m_IsVREnabled = false;
 	RenderDiagnosticGate m_RenderDiagnostics;
 	RenderTargetDiagnosticGate m_RenderTargetDiagnostics;
+	RenderConditionDiagnostics m_RenderConditions;
+	VRResourceLifecycle m_ResourceLifecycle;
 	MenuOverlayPlacement m_MenuOverlayPlacement;
 	bool m_IsInitialized = false;
 	bool m_RenderedNewFrame = false;

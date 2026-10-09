@@ -23,6 +23,7 @@
 #include "d3d9_fixed_function.h"
 #include "d3d9_swvp_emu.h"
 #include "d3d9_vr.h"
+#include "L4D2VR/render_condition_diagnostics.h"
 
 #include "d3d9_shader_permutations.h"
 
@@ -1186,6 +1187,7 @@ namespace dxvk {
 
     Com<D3D9SwapChainEx, false>     m_implicitSwapchain;
     Com<IDirect3DVR9>              m_vrBridge;
+    RenderConditionDiagnostics     m_vrDiagnostics;
 
     const D3D9Options               m_d3d9Options;
     DxsoOptions                     m_dxsoOptions;

@@ -22,6 +22,35 @@
 // The experimental launcher profile cancels it without changing shot origin.
 static const Vector kLegacyViewmodelPositionOffset{4.5f, -1.0f, 1.5f};
 
+namespace {
+class VRSubmissionScope
+{
+public:
+    explicit VRSubmissionScope(IDirect3DVR9* bridge) : m_Bridge(bridge)
+    { if (m_Bridge) m_Bridge->LockSubmissionQueue(); }
+    ~VRSubmissionScope() { if (m_Bridge) m_Bridge->UnlockSubmissionQueue(); }
+    VRSubmissionScope(const VRSubmissionScope&) = delete;
+    VRSubmissionScope& operator=(const VRSubmissionScope&) = delete;
+private:
+    IDirect3DVR9* m_Bridge;
+};
+
+bool TextureSubmissionReady(const SharedTextureHolder& holder)
+{
+    const auto& data = holder.m_VulkanData;
+    return VRTextureSubmissionReadiness{holder.m_VRTexture.handle != nullptr, data.m_nImage,
+        data.m_nWidth, data.m_nHeight, data.m_pDevice != nullptr, data.m_pPhysicalDevice != nullptr,
+        data.m_pInstance != nullptr, data.m_pQueue != nullptr, data.m_nSampleCount}.Ready();
+}
+
+std::string HRESULTText(HRESULT value)
+{
+    char text[16]{};
+    snprintf(text, sizeof(text), "0x%08lX", static_cast<unsigned long>(value));
+    return text;
+}
+}
+
 VR::VR(Game *game) 
 {
     m_Game = game;
@@ -166,6 +195,11 @@ VR::VR(Game *game)
 VR::~VR()
 {
     ReleaseMenuMouse();
+    DetachBackBufferOverlay();
+    if (m_OpenVRStarted && vr::VRCompositor()) {
+        const VRSubmissionScope queue(m_D3DVR);
+        vr::VRCompositor()->ClearLastSubmittedFrame();
+    }
     if (m_Overlay && m_HUDHandle != vr::k_ulOverlayHandleInvalid) {
         const auto result = m_Overlay->DestroyOverlay(m_HUDHandle);
         if (result != vr::VROverlayError_None)
@@ -177,10 +211,18 @@ VR::~VR()
             Logger::Write("OpenVR overlay cleanup failed: " + std::to_string(result));
     }
     if (m_OpenVRStarted) {
+        // The adopted bridge's bootstrap lease must not defer this owner's
+        // shutdown until after its submitted image owners have been released.
+        if (m_D3DVR) {
+            m_D3DVR->WaitDeviceIdle();
+            m_D3DVR->ReleaseRuntimeLease();
+        }
         m_OpenVRSession.Reset();
+        m_OpenVRStarted = false;
         Logger::Write("OpenVR runtime lease released");
     }
-    // The OpenVR consumer is gone before dropping any Vulkan image owners.
+    // This VR owner has stopped all consumer calls. Other devices can still
+    // retain shared-runtime leases; detachment/drain is not a compositor fence.
     m_Overlay = nullptr;
     InvalidateD3DResources();
     if (m_D3DVR) m_D3DVR->Release();
@@ -396,8 +438,12 @@ void VR::Update()
             }
 
             m_Game->m_CachedArmsModel = false;
-            m_CreatedVRTextures = false; // Have to recreate textures otherwise some workshop maps won't render
         } 
+        if (m_ResourceLifecycle.ObserveGameplay(inGame)) {
+            // Preserve the workshop refresh, once per return from gameplay.
+            m_CreatedVRTextures = false;
+            Logger::Write("VR resources: gameplay ended; one compatibility refresh requested");
+        }
     }
 
     SubmitVRTextures();
@@ -426,22 +472,62 @@ void VR::Update()
     }
 }
 
-void VR::InvalidateD3DResources()
+bool VR::DetachBackBufferOverlay(bool hide)
 {
-    if (m_Overlay) {
-        if (m_MainMenuHandle != vr::k_ulOverlayHandleInvalid) {
-            m_Overlay->HideOverlay(m_MainMenuHandle);
-            m_Overlay->ClearOverlayTexture(m_MainMenuHandle);
-        }
-        if (m_HUDHandle != vr::k_ulOverlayHandleInvalid) {
-            m_Overlay->HideOverlay(m_HUDHandle);
-            m_Overlay->ClearOverlayTexture(m_HUDHandle);
-        }
+    m_RenderConditions.SetVerbose(m_Config.verboseDiagnostics, GetTickCount64());
+    if (!m_Overlay || m_MainMenuHandle == vr::k_ulOverlayHandleInvalid) return true;
+    const VRSubmissionScope queue(m_D3DVR);
+    // Capture rotation clears the old texture while retaining visible menu
+    // heading/placement. Actual invalidation also hides the overlay.
+    vr::EVROverlayError error = vr::VROverlayError_None;
+    DetachVRMenuTexture(hide, [&] { m_Overlay->HideOverlay(m_MainMenuHandle); }, [&] {
+        error = m_Overlay->ClearOverlayTexture(m_MainMenuHandle);
+        return error == vr::VROverlayError_None;
+    });
+    if (m_RenderConditions.Observe(RenderCondition::MenuDetach, error != vr::VROverlayError_None,
+            {static_cast<std::uint64_t>(error)}) != RenderConditionChange::None)
+        Logger::Write("VR menu texture detach: error=" + std::to_string(error));
+    return error == vr::VROverlayError_None;
+}
+
+bool VR::InvalidateD3DResources(bool deviceReset)
+{
+    m_RenderConditions.SetVerbose(m_Config.verboseDiagnostics, GetTickCount64());
+    if (deviceReset) {
+        m_ResourceLifecycle.OnDeviceReset();
+        m_RenderTargetRetry.ResetForDevice();
+        m_RenderConditions.NewGeneration();
+        Logger::Write("VR resources invalidated for device lifecycle " +
+            std::to_string(m_ResourceLifecycle.DeviceGeneration()));
     }
-    m_HUDBoundsReady = false;
     m_CreatedVRTextures = false;
     m_RenderedNewFrame = false;
     m_RenderedHud = false;
+    m_HUDBoundsReady = false;
+    return RetireVRResources([&] {
+        const bool menuDetached = DetachBackBufferOverlay();
+        bool hudDetached = true;
+        if (m_Overlay && m_HUDHandle != vr::k_ulOverlayHandleInvalid) {
+            const VRSubmissionScope queue(m_D3DVR);
+            m_Overlay->HideOverlay(m_HUDHandle);
+            const auto hudError = m_Overlay->ClearOverlayTexture(m_HUDHandle);
+            hudDetached = hudError == vr::VROverlayError_None;
+            if (m_RenderConditions.Observe(RenderCondition::HudDetach, !hudDetached,
+                    {static_cast<std::uint64_t>(hudError)}) != RenderConditionChange::None)
+                Logger::Write("VR HUD texture detach: error=" + std::to_string(hudError));
+        }
+        if (m_OpenVRStarted && vr::VRCompositor()) {
+            const VRSubmissionScope queue(m_D3DVR);
+            vr::VRCompositor()->ClearLastSubmittedFrame();
+        }
+        return menuDetached && hudDetached;
+    }, [&] {
+        const HRESULT result = m_D3DVR ? m_D3DVR->WaitDeviceIdle() : D3D_OK;
+        if (m_RenderConditions.Observe(RenderCondition::ResourceDrain, FAILED(result),
+                {static_cast<std::uint32_t>(result)}) != RenderConditionChange::None)
+            Logger::Write("VR resource queue drain: hr=" + HRESULTText(result));
+        return SUCCEEDED(result);
+    }, [&] {
     auto releaseSurface = [](IDirect3DSurface9*& surface) {
         if (surface) {
             surface->Release();
@@ -460,27 +546,63 @@ void VR::InvalidateD3DResources()
     // Named Source textures are borrowed material-system objects. Only the
     // GetSurfaceLevel references above belong to the mod.
     m_LeftEyeTexture = m_RightEyeTexture = m_HUDTexture = m_BlankTexture = nullptr;
-    m_RenderTargetRetry.ResetForDevice();
+    if (deviceReset && m_D3DVR) m_D3DVR->DiscardBackBufferAfterDrain();
+    });
+}
+
+bool VR::RefreshBackBuffer(SharedTextureHolder& holder)
+{
+    m_RenderConditions.SetVerbose(m_Config.verboseDiagnostics, GetTickCount64());
+    holder = {};
+    const bool bridgeAvailable = m_D3DVR != nullptr;
+    if (m_RenderConditions.Observe(RenderCondition::Bridge, !bridgeAvailable) != RenderConditionChange::None)
+        Logger::Write(bridgeAvailable ? "DXVK VR bridge recovered" : "VR textures unavailable: no DXVK VR bridge");
+    if (!bridgeAvailable) return false;
+    const HRESULT result = m_D3DVR->GetBackBufferData(&holder);
+    const auto& data = holder.m_VulkanData;
+    if (m_RenderConditions.Observe(RenderCondition::BackBufferCapture, FAILED(result),
+            {static_cast<std::uint32_t>(result)}) != RenderConditionChange::None)
+        Logger::Write("VR back buffer descriptor: hr=" + HRESULTText(result));
+    if (m_RenderConditions.Observe(RenderCondition::BackBufferImage, !data.m_nImage,
+            {data.m_nImage != 0}) != RenderConditionChange::None)
+        Logger::Write(data.m_nImage ? "VR back buffer image recovered" : "VR back buffer image unavailable");
+    const bool dimensionsValid = data.m_nWidth && data.m_nHeight;
+    if (m_RenderConditions.Observe(RenderCondition::BackBufferDimensions, !dimensionsValid,
+            {data.m_nWidth, data.m_nHeight}) != RenderConditionChange::None)
+        Logger::Write("VR back buffer dimensions: " + std::to_string(data.m_nWidth) + "x" + std::to_string(data.m_nHeight));
+    const bool deviceDataValid = data.m_pDevice && data.m_pPhysicalDevice && data.m_pInstance &&
+        data.m_pQueue && data.m_nSampleCount;
+    if (m_RenderConditions.Observe(RenderCondition::BackBufferDevice, !deviceDataValid,
+            {data.m_pDevice != nullptr, data.m_pPhysicalDevice != nullptr, data.m_pInstance != nullptr,
+             data.m_pQueue != nullptr, data.m_nSampleCount}) != RenderConditionChange::None)
+        Logger::Write(deviceDataValid ? "VR back buffer device descriptor recovered" : "VR back buffer device descriptor incomplete");
+    return SUCCEEDED(result) && TextureSubmissionReady(holder);
 }
 
 void VR::CreateVRTextures()
 {
     const auto now = GetTickCount64();
-    if (!m_D3DVR || !m_RenderTargetRetry.CanAttempt(now, true))
-        return;
+    m_RenderConditions.SetVerbose(m_Config.verboseDiagnostics, now);
+    if (m_CreatedVRTextures) return;
+    if (m_RenderConditions.Observe(RenderCondition::RetryBudget, m_RenderTargetRetry.Exhausted()) != RenderConditionChange::None)
+        Logger::Write(m_RenderTargetRetry.Exhausted() ? "VR render target retry budget exhausted; reset/restart required" :
+            "VR render target retry budget recovered");
     SharedTextureHolder currentBackBuffer;
-    if (FAILED(m_D3DVR->GetBackBufferData(&currentBackBuffer)) ||
-        !currentBackBuffer.m_VulkanData.m_nImage ||
-        !currentBackBuffer.m_VulkanData.m_nWidth || !currentBackBuffer.m_VulkanData.m_nHeight)
+    if (!RefreshBackBuffer(currentBackBuffer) || !m_RenderTargetRetry.CanAttempt(now, true))
         return;
     // Preserve retry history when replacing partial resources from an attempt.
     const auto retryState = m_RenderTargetRetry;
-    InvalidateD3DResources();
+    if (!InvalidateD3DResources(false)) {
+        m_RenderTargetRetry.RecordFailure(now);
+        return;
+    }
     m_RenderTargetRetry = retryState;
 
     int windowWidth = 0, windowHeight = 0;
 
     IMatRenderContext* rndrContext = m_Game->m_MaterialSystem->GetRenderContext();
+    if (m_RenderConditions.Observe(RenderCondition::RenderContext, rndrContext == nullptr) != RenderConditionChange::None)
+        Logger::Write(rndrContext ? "VR material render context recovered" : "VR textures unavailable: material render context missing");
     if (rndrContext) {
         rndrContext->GetWindowSize(windowWidth, windowHeight);
         rndrContext->Release();
@@ -563,7 +685,12 @@ void VR::CreateVRTextures()
          m_VKRightEye.m_VRTexture.handle != nullptr},
         {m_BlankTexture != nullptr, m_D9BlankSurface != nullptr,
          m_VKBlankTexture.m_VRTexture.handle != nullptr}};
-    m_CreatedVRTextures = readiness.Ready();
+    m_CreatedVRTextures = readiness.Ready() && TextureSubmissionReady(m_VKLeftEye) &&
+        TextureSubmissionReady(m_VKRightEye) && TextureSubmissionReady(m_VKBlankTexture);
+    if (m_RenderConditions.Observe(RenderCondition::Allocation, !m_CreatedVRTextures,
+            {readiness.left.Ready(), readiness.right.Ready(), readiness.blank.Ready()}, true) != RenderConditionChange::None)
+        Logger::Write("VR render target readiness: left=" + std::to_string(readiness.left.Ready()) +
+            " right=" + std::to_string(readiness.right.Ready()) + " blank=" + std::to_string(readiness.blank.Ready()));
     if (!m_CreatedVRTextures) {
         m_RenderTargetRetry.RecordFailure(now);
         Logger::Write("VR render target creation failed: left=" +
@@ -574,10 +701,16 @@ void VR::CreateVRTextures()
                 "; retry budget exhausted; stereo disabled until device reset/restart" :
                 "; stereo bypassed; retry delayed at least one second"));
         const auto failedRetry = m_RenderTargetRetry;
-        InvalidateD3DResources();
+        InvalidateD3DResources(false);
         m_RenderTargetRetry = failedRetry;
     } else {
-        m_RenderTargetRetry.RecordSuccess();
+        // Newly allocated texture initializers must complete before the first
+        // Vulkan submission. Stable frames retain the existing Present wait.
+        const HRESULT result = m_D3DVR->WaitDeviceIdle();
+        if (m_RenderConditions.Observe(RenderCondition::ResourceDrain, FAILED(result),
+                {static_cast<std::uint32_t>(result)}) != RenderConditionChange::None)
+            Logger::Write("VR allocation queue drain: hr=" + HRESULTText(result));
+        m_CreatedVRTextures = CompleteVRTextureCreation(m_RenderTargetRetry, now, SUCCEEDED(result));
     }
 }
 
@@ -585,14 +718,15 @@ void VR::SubmitVRTextures()
 {
     // The bridge pins the image captured before Present rotates backbuffers.
     // Reacquire its descriptor every submission; never reuse a reset-era handle.
-    m_VKBackBuffer.m_VRTexture.handle = nullptr;
-    if (!m_D3DVR || FAILED(m_D3DVR->GetBackBufferData(&m_VKBackBuffer))) {
+    if (!RefreshBackBuffer(m_VKBackBuffer)) {
+        DetachBackBufferOverlay();
         if (m_Overlay) {
             m_Overlay->HideOverlay(m_MainMenuHandle);
             if (m_HUDHandle != vr::k_ulOverlayHandleInvalid)
                 m_Overlay->HideOverlay(m_HUDHandle);
         }
         m_RenderedNewFrame = false;
+        m_RenderedHud = false;
         ReleaseMenuMouse();
         return;
     }
@@ -603,9 +737,9 @@ void VR::SubmitVRTextures()
         if (!m_CreatedVRTextures)
             CreateVRTextures();
 
-        if (!m_BlankTexture || !m_VKBlankTexture.m_VRTexture.handle)
+        if (!m_CreatedVRTextures || !m_BlankTexture || !TextureSubmissionReady(m_VKBlankTexture))
             return;
-        if (FAILED(m_D3DVR->GetBackBufferData(&m_VKBackBuffer))) {
+        if (!RefreshBackBuffer(m_VKBackBuffer)) {
             m_Overlay->HideOverlay(m_MainMenuHandle);
             ReleaseMenuMouse();
             return;
@@ -630,6 +764,7 @@ void VR::SubmitVRTextures()
             return;
         }
         // Translation follows physical HMD; heading locks until reopening.
+        const VRSubmissionScope queue(m_D3DVR);
         const bool menuPositioned = RepositionOverlays();
         const vr::VRTextureBounds_t bounds{0, 0, mapping->bounds.uMax, mapping->bounds.vMax};
         const auto aspectError = m_Overlay->SetOverlayTexelAspect(m_MainMenuHandle, mapping->texelAspect);
@@ -649,7 +784,12 @@ void VR::SubmitVRTextures()
         {
             const auto leftError = vr::VRCompositor()->Submit(vr::Eye_Left, &m_VKBlankTexture.m_VRTexture, NULL, vr::Submit_Default);
             const auto rightError = vr::VRCompositor()->Submit(vr::Eye_Right, &m_VKBlankTexture.m_VRTexture, NULL, vr::Submit_Default);
-            if (m_RenderDiagnostics.First(RenderDiagnosticEvent::MenuSubmission))
+            if (m_RenderConditions.Observe(RenderCondition::MenuSubmit,
+                    !menuReady || showError != vr::VROverlayError_None || leftError != vr::VRCompositorError_None || rightError != vr::VRCompositorError_None,
+                    {static_cast<std::uint64_t>(aspectError), static_cast<std::uint64_t>(boundsError),
+                     static_cast<std::uint64_t>(textureError), static_cast<std::uint64_t>(mouseError),
+                     static_cast<std::uint64_t>(showError), static_cast<std::uint64_t>(leftError),
+                     static_cast<std::uint64_t>(rightError), menuPositioned}, true) != RenderConditionChange::None)
                 Logger::Write("VR menu submit: inGame=" + std::to_string(inGame) +
                     " backBuffer=" + std::to_string(m_VKBackBuffer.m_VRTexture.handle != nullptr) +
                     " blank=" + std::to_string(m_VKBlankTexture.m_VRTexture.handle != nullptr) +
@@ -660,12 +800,19 @@ void VR::SubmitVRTextures()
 
         return;
     }
+    if (!m_CreatedVRTextures || !TextureSubmissionReady(m_VKLeftEye) || !TextureSubmissionReady(m_VKRightEye)) {
+        m_RenderedNewFrame = m_RenderedHud = false;
+        return;
+    }
+    const VRSubmissionScope queue(m_D3DVR);
     vr::VROverlay()->HideOverlay(m_MainMenuHandle);
     m_MenuOverlayPlacement.Invalidate();
 
     const auto leftError = vr::VRCompositor()->Submit(vr::Eye_Left, &m_VKLeftEye.m_VRTexture, &(m_TextureBounds)[0], vr::Submit_Default);
     const auto rightError = vr::VRCompositor()->Submit(vr::Eye_Right, &m_VKRightEye.m_VRTexture, &(m_TextureBounds)[1], vr::Submit_Default);
-    if (m_RenderDiagnostics.First(RenderDiagnosticEvent::StereoSubmission))
+    if (m_RenderConditions.Observe(RenderCondition::StereoSubmit,
+            leftError != vr::VRCompositorError_None || rightError != vr::VRCompositorError_None,
+            {static_cast<std::uint64_t>(leftError), static_cast<std::uint64_t>(rightError)}, true) != RenderConditionChange::None)
         Logger::Write("VR stereo submit: left=" + std::to_string(m_VKLeftEye.m_VRTexture.handle != nullptr) +
             " right=" + std::to_string(m_VKRightEye.m_VRTexture.handle != nullptr) +
             " compositor=" + std::to_string(leftError) + "," + std::to_string(rightError));
@@ -675,6 +822,7 @@ void VR::SubmitVRTextures()
 
 void VR::SubmitExperimentalHUDOverlay()
 {
+    m_RenderConditions.SetVerbose(m_Config.verboseDiagnostics, GetTickCount64());
     if (!m_Overlay || m_HUDHandle == vr::k_ulOverlayHandleInvalid)
         return;
     if (m_RenderedHud && !m_HUDCaptureLogged) {
@@ -690,25 +838,23 @@ void VR::SubmitExperimentalHUDOverlay()
     const bool canShow = m_Config.experimentalHudOverlay && m_HUDBoundsReady &&
         m_RenderedNewFrame && m_RenderedHud && m_CreatedVRTextures &&
         m_HmdPose.valid && !m_Game->m_VguiSurface->IsCursorVisible() && m_HUDTexture &&
-        m_VKHUD.m_VRTexture.handle;
+        TextureSubmissionReady(m_VKHUD);
     if (!canShow) {
         if (m_Overlay->IsOverlayVisible(m_HUDHandle))
             m_Overlay->HideOverlay(m_HUDHandle);
         return;
     }
+    const VRSubmissionScope queue(m_D3DVR);
     const auto textureError = m_Overlay->SetOverlayTexture(m_HUDHandle, &m_VKHUD.m_VRTexture);
     const auto showError = textureError == vr::VROverlayError_None ?
         m_Overlay->ShowOverlay(m_HUDHandle) : textureError;
-    if (textureError != vr::VROverlayError_None || showError != vr::VROverlayError_None) {
+    const bool submissionFailed = textureError != vr::VROverlayError_None || showError != vr::VROverlayError_None;
+    if (m_RenderConditions.Observe(RenderCondition::HudSubmit, submissionFailed,
+            {static_cast<std::uint64_t>(textureError), static_cast<std::uint64_t>(showError)}, true) != RenderConditionChange::None)
+        Logger::Write("Experimental HUD overlay submission: texture=" + std::to_string(textureError) +
+            " visibility=" + std::to_string(showError) + " (pixels/alpha/subtitles unverified)");
+    if (submissionFailed) {
         m_Overlay->HideOverlay(m_HUDHandle);
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= m_NextHUDOverlayErrorLog) {
-            Logger::Write("Experimental HUD overlay submission failed: " +
-                std::to_string(textureError) + "," + std::to_string(showError));
-            m_NextHUDOverlayErrorLog = now + std::chrono::seconds(5);
-        }
-    } else if (m_RenderDiagnostics.First(RenderDiagnosticEvent::HudOverlayShown)) {
-        Logger::Write("Experimental HUD overlay submitted successfully (pixels/alpha/subtitles unverified)");
     }
 }
 
@@ -853,7 +999,11 @@ void VR::GetPoses()
 
 bool VR::UpdatePosesAndActions()
 {
-    const auto poseError = vr::VRCompositor()->WaitGetPoses(m_Poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
+    vr::EVRCompositorError poseError;
+    {
+        const VRSubmissionScope queue(m_D3DVR);
+        poseError = vr::VRCompositor()->WaitGetPoses(m_Poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
+    }
     if (poseError != vr::VRCompositorError_None) {
         if (m_LastPoseError != poseError)
             Logger::Write("WaitGetPoses failed: " + std::to_string(poseError));
@@ -956,6 +1106,30 @@ void VR::ProcessHeldAction(vr::VRActionHandle_t actionHandle, DigitalButtonState
     if (const char *command = state.HeldCommand(active, data.bChanged, data.bState,
                                                  pressCommand, releaseCommand))
         m_Game->ClientCmd_Unrestricted(command);
+}
+
+void VR::InvalidateTrackingOutput()
+{
+    m_RenderedNewFrame = m_RenderedHud = false;
+    m_TrackingOutputValid = m_LeftControllerOutputValid = false;
+    m_HmdPose.valid = m_LeftControllerPose.valid = m_RightControllerPose.valid = false;
+    std::fill(std::begin(m_Poses), std::end(m_Poses), vr::TrackedDevicePose_t{});
+    m_LeftControllerPosRel = m_RightControllerPosRel = {0.0f, 0.0f, 0.0f};
+    m_PrevFrameTime = std::chrono::steady_clock::now();
+    m_HmdLostSinceLastValid = true;
+    m_RoomscaleMotor.Reset();
+    m_PortalCoordinator.CancelPending();
+    m_RoomscaleObserver.OnPose(false, {}, m_PoseFetchSequence, 0.0f, 1.0f, true);
+    m_PortalShotHapticGate.Clear();
+    ResetMuzzleSample();
+}
+
+void VR::SuspendInputForRenderFailure()
+{
+    // CPU/input cleanup only: no OpenVR consumer calls, graphics submission,
+    // allocation or queue locks while the producer drain is unavailable.
+    SuspendVRInputAfterRenderFailure([&] { InvalidateTrackingOutput(); },
+        [&] { ReleaseHeldActions(); }, [&] { ReleaseMenuMouse(); });
 }
 
 void VR::ReleaseHeldActions()
