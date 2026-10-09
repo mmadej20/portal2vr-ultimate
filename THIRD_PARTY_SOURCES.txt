@@ -9,10 +9,12 @@ DXVK (VR fork)
 
   This is an altered source snapshot, not an unmodified upstream release.
   Relative to the base commit, Portal2VR changes the following files for
-  startup and render-target readiness:
+  startup, render-target readiness, VR resource retirement and diagnostics:
     dxvk/src/d3d9/d3d9_device.cpp
+    dxvk/src/d3d9/d3d9_device.h
     dxvk/src/d3d9/d3d9_interface.cpp
     dxvk/src/d3d9/d3d9_vr.cpp
+    dxvk/src/d3d9/d3d9_vr.h
 
 MinHook
   Upstream: https://github.com/TsudaKageyu/minhook

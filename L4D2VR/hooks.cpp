@@ -14,6 +14,7 @@
 #include "reticle_telemetry.h"
 #include "native_reticle.h"
 #include "native_beam.h"
+#include "eye_hud.h"
 #include <Windows.h>
 #include <intrin.h>
 #include <array>
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -445,6 +447,17 @@ void Hooks::Initialize()
 			"Experimental HUD VGUI capture hooks enabled" :
 			"Experimental HUD capture unavailable; stereo rendering remains enabled");
 	}
+    else if (m_VR->m_Config.hudInEyeCentered) {
+        // Legacy eye HUD needs only the paint detour. Caption target-stack
+        // hooks remain a separate optional group with their existing policy.
+        const auto paint = m_Game->m_Offsets->VGui_Paint.address;
+        m_EyeHudHookReady = paint &&
+            !hkVgui_Paint.createHook(reinterpret_cast<LPVOID>(paint), &dVGui_Paint) &&
+            !hkVgui_Paint.enableHook();
+        Logger::Write(m_EyeHudHookReady ?
+            "Legacy eye HUD paint hook enabled (pixels unverified)" :
+            "Legacy eye HUD paint hook unavailable; original layout retained");
+    }
     InitViewmodelAlignment();
     InitMuzzleSampling();
     InitNativeBeam();
@@ -1377,6 +1390,37 @@ void Hooks::dPopRenderTargetAndViewport(void *ecx, void *edx)
 
 void Hooks::dVGui_Paint(void *ecx, void *edx, int mode)
 {
+    if (RuntimePublished() && m_Game->m_Hooks->m_EyeHudHookReady &&
+        m_VR->m_Config.hudInEyeCentered && !m_VR->m_Config.experimentalHudOverlay &&
+        m_VR->m_AimMode != 2 && EyeHud::IsGameplayOnlyPaint(mode, PAINT_INGAMEPANELS) && m_ActiveAimEyeView &&
+        m_VR->m_IsVREnabled && m_VR->m_TrackingOutputValid && m_VR->m_CreatedVRTextures &&
+        m_Game->m_EngineClient->IsInGame() && !m_Game->m_VguiSurface->IsCursorVisible()) {
+        const auto release = [](IMatRenderContext *context) { if (context) context->Release(); };
+        std::unique_ptr<IMatRenderContext, decltype(release)> context(
+            m_Game->m_MaterialSystem->GetRenderContext(), release);
+        if (context && CheckRenderContextAbi(context.get()) != Portal2MaterialAbi::Kind::Unsupported) {
+            ITexture *eyeTarget = m_ActiveAimEye == 1 ? m_VR->m_LeftEyeTexture :
+                m_ActiveAimEye == 2 ? m_VR->m_RightEyeTexture : nullptr;
+            const EyeHud::GameplayScope scope{true, true, true, true, true, false,
+                true, eyeTarget && context->GetRenderTarget() == eyeTarget, true};
+            if (EyeHud::CanCenter(scope, m_VR->m_Config.hudInEyeCentered,
+                    m_VR->m_Config.experimentalHudOverlay, m_VR->m_AimMode)) {
+                int windowWidth = 0, windowHeight = 0;
+                context->GetWindowSize(windowWidth, windowHeight);
+                const auto &eye = *m_ActiveAimEyeView;
+                const auto rect = EyeHud::CenteredRect(eye.width, eye.height, windowWidth, windowHeight,
+                    m_VR->m_Config.hudInEyeScale, m_VR->m_Config.hudInEyeVerticalOffset);
+                EyeHud::Rect previous{};
+                context->GetViewport(previous.x, previous.y, previous.width, previous.height);
+                if (rect && previous.width > 0 && previous.height > 0) {
+                    // VGUI initializes its orthographic canvas from this viewport.
+                    // Never rebind the eye target or alter its depth attachment.
+                    EyeHud::ViewportScope<IMatRenderContext> viewport(*context, previous, *rect);
+                    return hkVgui_Paint.fOriginal(ecx, mode);
+                }
+            }
+        }
+    }
 	if (!Portal2VRRuntime::IsPublished(g_Game, m_Game) ||
 		!m_VR->m_Config.experimentalHudOverlay)
 		return hkVgui_Paint.fOriginal(ecx, mode);
@@ -1636,6 +1680,28 @@ bool Hooks::ScreenTransform(const Vector& point, Vector* pScreen, int width, int
 
 int __fastcall Hooks::dDrawSelf(void* ecx, void* edx, int x, int y, int w, int h, const void* clr, float flApparentZ) {
 	if (!RuntimePublished()) return hkDrawSelf.fOriginal(ecx, x, y, w, h, clr, flApparentZ);
+    if (!m_VR->m_Config.showSourceCrosshair && (m_VR->m_AimMode == 0 || m_VR->m_AimMode == 1) &&
+        m_ActiveAimEyeView && m_VR->m_IsVREnabled && m_VR->m_TrackingOutputValid &&
+        m_VR->m_CreatedVRTextures && m_Game->m_EngineClient->IsInGame() &&
+        !m_Game->m_VguiSurface->IsCursorVisible() && !m_ExplicitHudCaptureActive && !m_HudTargetActive) {
+        // Keep Source ShouldDraw and every Portal status sprite. This option
+        // controls only recognized generic flat HUD artwork in legacy eyes.
+        const auto identity = ReadSourceHudTextureIdentity(ecx);
+        if (identity) {
+            IMatRenderContext *context = m_Game->m_MaterialSystem->GetRenderContext();
+            if (context) {
+                const bool verified = CheckRenderContextAbi(context) != Portal2MaterialAbi::Kind::Unsupported;
+                ITexture *eyeTarget = m_ActiveAimEye == 1 ? m_VR->m_LeftEyeTexture :
+                    m_ActiveAimEye == 2 ? m_VR->m_RightEyeTexture : nullptr;
+                const bool matches = verified && eyeTarget && context->GetRenderTarget() == eyeTarget;
+                context->Release();
+                const EyeHud::GameplayScope scope{true, true, true, true, true, false, true, matches, verified};
+                if (EyeHud::ShouldHideFlatCrosshair(scope, false, m_VR->m_AimMode,
+                        identity->shortName.data(), identity->textureFile.data()))
+                    return 0;
+            }
+        }
+    }
 	//std::cout << "dDrawSelf - X: " << x << ", Y: " << y << ", W: " << w << ", H: " << h << ", Z: " << flApparentZ << "\n";
 
 	//int playerIndex = m_Game->m_EngineClient->GetLocalPlayer();

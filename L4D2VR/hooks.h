@@ -174,6 +174,7 @@ public:
 	RequiredHooks m_RequiredHooks;
 	OptionalHooks m_CompatibilityHooks;
 	bool m_HudCaptureHooksReady = false;
+    bool m_EyeHudHookReady = false;
 	static inline Game *m_Game;
 	static inline VR *m_VR;
 

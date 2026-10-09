@@ -38,6 +38,10 @@ IDirect3DVR9 : public IUnknown{
   virtual HRESULT STDMETHODCALLTYPE CaptureBackBufferData() = 0;
   virtual void STDMETHODCALLTYPE InvalidateBackBufferData() = 0;
   virtual HRESULT STDMETHODCALLTYPE GetBackBufferData(SharedTextureHolder *backBufferData) = 0;
+  virtual void STDMETHODCALLTYPE DiscardBackBufferAfterDrain() = 0;
+  virtual void STDMETHODCALLTYPE LockSubmissionQueue() = 0;
+  virtual void STDMETHODCALLTYPE UnlockSubmissionQueue() = 0;
+  virtual void STDMETHODCALLTYPE ReleaseRuntimeLease() = 0;
 };
 
 #ifdef _MSC_VER

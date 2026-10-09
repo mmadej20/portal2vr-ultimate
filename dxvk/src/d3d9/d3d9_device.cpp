@@ -391,7 +391,8 @@ namespace dxvk {
     D3D9DeviceLock lock = LockDevice();
     Game* const game = g_Game.load(std::memory_order_acquire);
     if (game && game->m_VR && game->m_VR->OwnsD3DDevice(this)) {
-      game->m_VR->InvalidateD3DResources();
+      m_vrDiagnostics.NewGeneration();
+      if (!game->m_VR->InvalidateD3DResources()) return D3DERR_DEVICELOST;
       if (m_vrBridge != nullptr)
         m_vrBridge->InvalidateBackBufferData();
     }
@@ -570,14 +571,21 @@ namespace dxvk {
                 const HRESULT surfaceResult = texture->GetSurfaceLevel(0, surfaceTarget);
               const HRESULT shareResult = SUCCEEDED(surfaceResult) && m_vrBridge != nullptr
                   ? m_vrBridge->GetVRDesc(*surfaceTarget, &texDesc) : D3DERR_INVALIDCALL;
+              const RenderCondition condition = texID == VR::Texture_LeftEye ? RenderCondition::LeftShare :
+                  texID == VR::Texture_RightEye ? RenderCondition::RightShare :
+                  texID == VR::Texture_HUD ? RenderCondition::HudShare : RenderCondition::BlankShare;
+              m_vrDiagnostics.SetVerbose(game->m_VR->m_Config.verboseDiagnostics, GetTickCount64());
+              if (m_vrDiagnostics.Observe(condition, FAILED(shareResult),
+                    {static_cast<std::uint32_t>(surfaceResult), static_cast<std::uint32_t>(shareResult),
+                     static_cast<std::uint32_t>(texDesc.Format), texDesc.Width, texDesc.Height, texDesc.SampleCount}, true) != RenderConditionChange::None)
+                Logger::info(str::format("Portal2VR texture sharing: target=", texID,
+                    " surface=", surfaceResult, " descriptor=", shareResult, " format=", texDesc.Format,
+                    " size=", texDesc.Width, "x", texDesc.Height, " samples=", texDesc.SampleCount));
               if (SUCCEEDED(shareResult)) {
                   memcpy(&textureTarget->m_VulkanData, &texDesc, sizeof(vr::VRVulkanTextureData_t));
                   textureTarget->m_VRTexture.handle = &textureTarget->m_VulkanData;
                   textureTarget->m_VRTexture.eColorSpace = vr::ColorSpace_Auto;
                   textureTarget->m_VRTexture.eType = vr::TextureType_Vulkan;
-              } else {
-                  Logger::err(str::format("Portal2VR texture sharing failed: ", texID,
-                                          " surface=", surfaceResult, " descriptor=", shareResult));
               }
           }
       }
@@ -3571,6 +3579,10 @@ namespace dxvk {
     D3D9DeviceLock lock = LockDevice();
     Game* const game = g_Game.load(std::memory_order_acquire);
     const bool ownedVR = game && game->m_VR && game->m_VR->OwnsD3DDevice(this);
+    m_vrDiagnostics.SetVerbose(game && game->m_VR && game->m_VR->m_Config.verboseDiagnostics, GetTickCount64());
+    if (game && game->m_VR && m_vrDiagnostics.Observe(RenderCondition::PresentOwnership,
+            !ownedVR || m_vrBridge == nullptr, {ownedVR, m_vrBridge != nullptr}) != RenderConditionChange::None)
+      Logger::warn(str::format("Portal2VR Present ownership: owned=", ownedVR, " bridge=", m_vrBridge != nullptr));
     if (ownedVR && m_vrBridge != nullptr) {
       IDirect3DSurface9* backBuffer = nullptr;
       if (SUCCEEDED(GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer) {
@@ -3600,8 +3612,16 @@ namespace dxvk {
 	  
 	if (ownedVR && m_vrBridge != nullptr)
     {
-        m_vrBridge->WaitDeviceIdle();
-        game->m_VR->Update();
+        const HRESULT idleResult = m_vrBridge->WaitDeviceIdle();
+        if (m_vrDiagnostics.Observe(RenderCondition::ResourceDrain, FAILED(idleResult),
+                {static_cast<std::uint32_t>(idleResult)}) != RenderConditionChange::None)
+          Logger::warn(str::format("Portal2VR Present queue drain: hr=", idleResult));
+        if (SUCCEEDED(idleResult)) {
+          game->m_VR->Update();
+        } else {
+          m_vrBridge->InvalidateBackBufferData();
+          game->m_VR->SuspendInputForRenderFailure();
+        }
     }
 	  
 	return result;
@@ -3761,7 +3781,8 @@ namespace dxvk {
     D3D9DeviceLock lock = LockDevice();
     Game* const game = g_Game.load(std::memory_order_acquire);
     if (game && game->m_VR && game->m_VR->OwnsD3DDevice(this)) {
-      game->m_VR->InvalidateD3DResources();
+      m_vrDiagnostics.NewGeneration();
+      if (!game->m_VR->InvalidateD3DResources()) return D3DERR_DEVICELOST;
       if (m_vrBridge != nullptr)
         m_vrBridge->InvalidateBackBufferData();
     }
