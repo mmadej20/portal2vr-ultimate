@@ -47,6 +47,8 @@ SETTINGS = (
             help="LegacyYaw is recommended. Other modes are experimental; floor/ceiling comfort remains unverified."),
     Setting("AimMode", "Aim mode", "Aiming", "2", ("0", "1", "2"),
             help="2: beam + reticle (recommended). 0: none. 1: legacy crosshair, known limitations."),
+    Setting("ShowSourceCrosshair", "Show legacy flat crosshair", "Aiming", "true", ("false", "true"),
+            help="Only recognized generic flat crosshair in AimMode 0/1. Portal status artwork remains visible."),
     Setting("ExperimentalWorldAimMarker", "World aim line", "Aiming", "false", ("false", "true"),
             help="Tested line. Off selects robot_point_beam, which is currently not visible on the tested setup."),
     Setting("ExperimentalStereoReticle", "Atlas reticle rollback", "Aiming", "false", ("false", "true"),
@@ -64,6 +66,11 @@ SETTINGS = (
     Setting("ViewmodelAngCustomOffsetZ", "Gun Z angle (degrees)", "Gun calibration", "0", bounds=(-180, 180)),
     Setting("ExperimentalHUDOverlay", "Readable caption overlay", "Captions", "false", ("false", "true"),
             help="Tested subtitle capture; requires AimMode=2. Enable subtitles in Portal 2 as well."),
+    Setting("HUDInEyeCentered", "Center legacy HUD in eyes", "Legacy HUD", "false", ("false", "true"),
+            help="Experimental; restart required. Requires AimMode 0/1 and readable caption overlay off. Retains original layout if the rectangle does not fit."),
+    Setting("HUDInEyeScale", "Legacy HUD width fraction", "Legacy HUD", "0.45", bounds=(.2, 1)),
+    Setting("HUDInEyeVerticalOffset", "Legacy HUD vertical offset fraction", "Legacy HUD", "0.05", bounds=(-.4, .4),
+            help="Positive moves down. Applies only with legacy HUD centering enabled."),
     Setting("HUDDistanceMeters", "Caption distance (m)", "Captions", "1.3", bounds=(.6, 3)),
     Setting("HUDWidthMeters", "Caption panel width (m)", "Captions", "1.4", bounds=(.5, 2.5)),
     Setting("HUDVerticalOffsetMeters", "Caption height relative to eyes (m)", "Captions", "-0.15", bounds=(-.6, .6),
@@ -78,6 +85,7 @@ SETTINGS = (
 )
 BASIC_KEYS = frozenset(("TrackingMode", "MovementDirection", "RoomscaleMode", "SnapTurning",
                         "SnapTurnAngle", "TurnSpeed", "RenderWindow"))
+_EYE_HUD_KEYS = frozenset(("HUDInEyeCentered", "HUDInEyeScale", "HUDInEyeVerticalOffset", "ShowSourceCrosshair"))
 
 
 def recommended_settings() -> dict[str, str]:
@@ -118,6 +126,8 @@ def validate_settings(values: dict[str, str]) -> dict[str, str]:
             raise ValueError("ActiveExperimental roomscale requires 6DOF=true and PortalOrientationMode=LegacyYaw")
     if result["AimFromViewmodelMuzzle"] == "true" and result["ExperimentalViewmodelAlignment"] != "true":
         raise ValueError("AimFromViewmodelMuzzle requires ExperimentalViewmodelAlignment=true")
+    if result["HUDInEyeCentered"] == "true" and (result["AimMode"] == "2" or result["ExperimentalHUDOverlay"] == "true"):
+        raise ValueError("HUDInEyeCentered requires AimMode=0 or 1 and ExperimentalHUDOverlay=false")
     return result
 
 
@@ -137,7 +147,15 @@ def load_preferences(path: Path, legacy: dict) -> dict:
         return _validated_preferences({"version": 1, "game_dir": legacy["game_dir"],
                                        "steam_exe": legacy["steam_exe"], "values": recommended_settings()})
     try:
-        return _validated_preferences(json.loads(path.read_text(encoding="utf-8")))
+        prefs = json.loads(path.read_text(encoding="utf-8"))
+        # Upgrade only the previous complete schema, without writing on load.
+        # Unknown, missing and partially upgraded schemas still fail validation.
+        if isinstance(prefs, dict) and isinstance(prefs.get("values"), dict):
+            previous_keys = {item.key for item in SETTINGS} - _EYE_HUD_KEYS
+            if prefs["values"].keys() == previous_keys:
+                prefs = {**prefs, "values": {**prefs["values"],
+                         **{item.key: item.default for item in SETTINGS if item.key in _EYE_HUD_KEYS}}}
+        return _validated_preferences(prefs)
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError(f"Cannot read launcher preferences {path}: {error}. The file was not changed.") from error
 
