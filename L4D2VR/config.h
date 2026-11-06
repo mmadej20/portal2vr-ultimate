@@ -21,6 +21,10 @@ struct ConfigSnapshot {
     RoomscaleMotion::Mode roomscaleMode = RoomscaleMotion::Mode::Off;
     PortalOrientation::Mode portalOrientationMode = PortalOrientation::Mode::LegacyYaw;
     bool experimentalHudOverlay = false;
+    bool hudInEyeCentered = false;
+    float hudInEyeScale = 0.45f;
+    float hudInEyeVerticalOffset = 0.05f;
+    bool showSourceCrosshair = true;
     bool experimentalWorldAimMarker = false;
     bool experimentalStereoReticle = false;
     bool reticleDistanceScaling = true;
@@ -64,6 +68,8 @@ inline std::string TrimConfigValue(const std::string &text)
 
 inline bool ValidateConfig(const ConfigSnapshot &candidate, std::vector<std::string> &errors)
 {
+    if (candidate.hudInEyeCentered && (candidate.aimMode == 2 || candidate.experimentalHudOverlay))
+        errors.push_back("HUDInEyeCentered requires AimMode=0 or 1 and ExperimentalHUDOverlay=false");
     if (candidate.roomscaleMode == RoomscaleMotion::Mode::ActiveExperimental &&
         (!candidate.sixDof || candidate.portalOrientationMode != PortalOrientation::Mode::LegacyYaw))
         errors.push_back("ActiveExperimental roomscale requires 6DOF=true and PortalOrientationMode=LegacyYaw");
@@ -89,6 +95,8 @@ inline ConfigParseResult ApplyRuntimeConfig(const ConfigSnapshot &previous,
         };
         keep(parsed.value.antiAliasing, previous.antiAliasing,
              "AntiAliasing change requires a restart; keeping current value");
+        keep(parsed.value.hudInEyeCentered, previous.hudInEyeCentered,
+             "HUDInEyeCentered change requires restart; keeping current hook policy");
         keep(parsed.value.trackingMode, previous.trackingMode,
              "TrackingMode change requires restart; keeping active compositor origin");
         keep(parsed.value.experimentalViewmodelAlignment, previous.experimentalViewmodelAlignment,
@@ -213,6 +221,10 @@ inline ConfigParseResult ParseConfig(std::istream &stream, const ConfigSnapshot 
     }
     readBool("VerboseDiagnostics", result.value.verboseDiagnostics);
     readBool("ExperimentalHUDOverlay", result.value.experimentalHudOverlay);
+    readBool("HUDInEyeCentered", result.value.hudInEyeCentered);
+    readFloat("HUDInEyeScale", result.value.hudInEyeScale, 0.2f, 1.0f);
+    readFloat("HUDInEyeVerticalOffset", result.value.hudInEyeVerticalOffset, -0.4f, 0.4f);
+    readBool("ShowSourceCrosshair", result.value.showSourceCrosshair);
     readBool("ExperimentalWorldAimMarker", result.value.experimentalWorldAimMarker);
     readBool("ExperimentalStereoReticle", result.value.experimentalStereoReticle);
     readBool("ReticleDistanceScaling", result.value.reticleDistanceScaling);
@@ -247,6 +259,10 @@ inline ConfigParseResult ParseConfig(std::istream &stream, const ConfigSnapshot 
     for (int i = 0; i < 3; ++i) {
         readFloat(std::string("ViewmodelPosCustomOffset") + axes[i], result.value.viewmodelPosOffset[i], -100.f, 100.f);
         readFloat(std::string("ViewmodelAngCustomOffset") + axes[i], result.value.viewmodelAngOffset[i], -180.f, 180.f);
+    }
+    if (result.value.hudInEyeCentered && (result.value.aimMode == 2 || result.value.experimentalHudOverlay)) {
+        result.value.hudInEyeCentered = false;
+        result.notes.push_back("HUDInEyeCentered disabled: requires AimMode=0 or 1 and ExperimentalHUDOverlay=false");
     }
     return result;
 }

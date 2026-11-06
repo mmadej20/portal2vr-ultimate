@@ -45,7 +45,7 @@ jobs:
           $msbuild = '${{ steps.msbuild.outputs.path }}'
           & $msbuild l4d2vr.sln /t:Build /m /p:Configuration=Release /p:Platform=x86 '/p:PORTAL2_DIR='
           if ($LASTEXITCODE -ne 0) { throw 'Release x86 DLL build failed' }
-          foreach ($project in @('stabilization_tests', 'd3d9_bridge_tests', 'native_safety_tests', 'hook_rollback_tests', 'verified_symbol_tests')) {
+          foreach ($project in @('stabilization_tests', 'd3d9_bridge_tests', 'native_safety_tests', 'hook_rollback_tests', 'verified_symbol_tests', 'pcvr_render_tests', 'pcvr_hud_tests')) {
             & $msbuild "tests/$project.vcxproj" /t:Build /m /p:Configuration=Release /p:Platform=Win32
             if ($LASTEXITCODE -ne 0) { throw "$project build failed" }
             & "tests/bin/$project.exe"

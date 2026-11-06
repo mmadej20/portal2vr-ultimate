@@ -68,6 +68,33 @@ Do not delete install state/backups to fix an error. If only user preferences ar
 - `EyePosition`, `Weapon_ShootPosition` and `GetViewModelFOV` use audited RVAs only after the DLL's SHA-256 and its loaded code/table references match the supported build. The shoot-origin override applies only to the verified `FirePortal` call, preserving other calls to the shared function. An unsupported DLL, failed verification or failed hook installation produces a warning in `bin/portal2vr.log` and skips that hook without blocking startup; Source's original shoot position or viewmodel FOV may be used. The user reported successful hardware testing on one current setup; other game builds and setups require separate validation.
 - No OpenXR backend, haptic redesign, optimized desktop mirror, Portal Reloaded ThirdAttack support or complete HUD rewrite. Haptics cover local portal shots, not every interaction.
 
+## Selective PCVR improvements
+
+The `native-vr` fork was reviewed at commit [`0094269`](https://github.com/iFeelLikeChicken2Nite/portal2vr-ultimate/commit/0094269795aa29d2b0477af00e082b8b686aa68c). The changes here adapt its menu-refresh and HUD ideas independently of Sixense. No fork commits were cherry-picked, and no Sixense/Hydra proxy, bindings, module aliases, calibration or alternate engine ABI were added.
+
+Render targets retain their existing ownership and bounded retry policy. A return from gameplay to the menu/loading state requests one compatibility refresh instead of recreating every menu frame. A real D3D9 reset invalidates resources independently, including while already in a menu. Failed creation keeps stereo disabled and retains the existing one-second backoff and three-attempt budget, including failures of the final allocation drain. Missing bridge/backbuffer data waits for recovery without consuming allocation attempts. A failed Present queue drain clears tracking validity and releases held actions/menu clicks, preventing stale controller input while submission is unavailable. Menu/pause cursor handling remains on the existing overlay path.
+
+Graphics diagnostics report initial failures, changed failure details and recovery. Quiet mode suppresses unchanged repeated conditions per instance; **Verbose diagnostics** repeats unchanged details at most once every five seconds per condition. New failures, changed details and recovery remain immediate. Logs distinguish missing bridge/capture/image/dimensions/context, non-owned devices, recreation/reset and submission failures. A successful API call or allocation does not establish correct headset pixels.
+
+Advanced offers these optional legacy HUD controls:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `HUDInEyeCentered` | `false` | Centers in-game HUD panels within each eye. Requires `AimMode=0` or `1` and `ExperimentalHUDOverlay=false`. |
+| `HUDInEyeScale` | `0.45` | Width as a fraction of the eye target; allowed range `0.2` to `1`. Aspect is retained and the rectangle must fit inside the eye. |
+| `HUDInEyeVerticalOffset` | `0.05` | Vertical offset as a fraction of eye height; allowed range `-0.4` to `0.4`. Positive moves down. |
+| `ShowSourceCrosshair` | `true` | `false` hides recognized flat Source crosshair sprites in legacy VR eye rendering. It preserves native blue/orange Portal status, menus, desktop drawing, controller aiming and world aim lines. |
+
+HUD centering changes only a validated eye viewport and restores the previous viewport on scope exit. It does not bind a different depth buffer. Mixed paint passes containing UI/cursor layers retain the original viewport. Incompatible centering settings are rejected by the launcher; the native parser falls back safely. The recommended native reticle/caption profile stays unchanged. Previously saved complete launcher preferences gain the new defaults without resetting existing values or paths; malformed/incomplete preferences remain errors.
+
+Native controller grabbing and hold-distance adjustment are **deferred**. The fork's hand-origin override covers `UpdateObject` but misses directly invoked `UpdateObjectVM`, detects holding without a verified local-player check, and writes ConVar fields through assumed offsets. Its distance mapping can bypass native bounds, and disabling the feature can skip restoration. These fail the safety gate for standard Portal 2.
+
+A future grab experiment needs exact-build verified coverage of both update paths and their `EyePosition`/`EyeAngles` calls; a local-player, current-controller-pose and confirmed-held-object gate; scoped nested restoration; and a verified `ICvar`/ConVar accessor to snapshot, set and restore all affected values on drop, disable, level change and shutdown. Distance adjustment should use a dedicated input action while holding. No grab settings, memory writes or input changes are shipped here.
+
+These changes require a fresh game/headset session. Test startup, repeated menu idling and returns, pause/resume, campaign/workshop map loads, a graphics reset while in a menu and in gameplay, controller loss/recovery, exit, and log recovery after a transient failure. Test optional HUD controls in both eyes with legacy aiming; confirm that the recommended native portal-status reticle, captions, menu pointer and aim line behave as before. A map switch that never exposes a non-game state needs separate observation; scene transitions alone do not prove every Source resource event.
+
+OpenVR Vulkan submissions use the application's queue, so consumer detachment and producer queue draining are resource-ordering safeguards, not a compositor fence or proof across drivers. The modified DXVK/OpenVR resource lifetime remains a runtime compatibility risk. See [Valve's Vulkan integration guidance](https://github.com/ValveSoftware/openvr/wiki/Vulkan). No new hardware validation is claimed by this backport.
+
 ## Building and verification
 
 Use Visual Studio 2022 / Build Tools with the C++ desktop workload, MSVC v143 and a Windows SDK. Build **Release / x86**; the game-facing DLL must remain 32-bit. DXVK, OpenVR and MinHook sources are included; no submodule initialization is required.
@@ -78,6 +105,10 @@ From a Developer Command Prompt in the repository root:
 msbuild l4d2vr.sln /t:Build /p:Configuration=Release /p:Platform=x86 /p:PORTAL2_DIR=
 msbuild tests\stabilization_tests.vcxproj /t:Build /p:Configuration=Release /p:Platform=Win32
 tests\bin\stabilization_tests.exe
+msbuild tests\pcvr_render_tests.vcxproj /t:Build /p:Configuration=Release /p:Platform=Win32
+tests\bin\pcvr_render_tests.exe
+msbuild tests\pcvr_hud_tests.vcxproj /t:Build /p:Configuration=Release /p:Platform=Win32
+tests\bin\pcvr_hud_tests.exe
 python -m unittest discover -s tests -p test_*.py
 ```
 

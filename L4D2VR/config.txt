@@ -5,6 +5,10 @@ MovementDirection=HMD # HMD, LeftController, RightController
 RoomscaleMode=Off # Off, Observe (no movement), or ActiveExperimental (unverified CUserCmd movement; LegacyYaw + 6DOF required; restart)
 PortalOrientationMode=LegacyYaw # FullRotation, YawOnly, PreserveHorizon are experimental; restart required
 ExperimentalHUDOverlay=false # Existing HUD capture shown in a noninteractive SteamVR overlay; hardware-unverified, restart required
+HUDInEyeCentered=false # Optional legacy HUD centering; restart required, AimMode=0/1 and ExperimentalHUDOverlay=false only
+HUDInEyeScale=0.45 # 0.2-1.0; fraction of eye width; out-of-eye rectangles retain original layout
+HUDInEyeVerticalOffset=0.05 # -0.4 to 0.4; fraction of eye height, positive moves down
+ShowSourceCrosshair=true # false hides recognized generic flat crosshair in legacy eyes; Portal status artwork remains visible
 ExperimentalWorldAimMarker=false # Experimental Source 3D muzzle line; replaces particle laser when available, independent of the reticle renderer
 ExperimentalStereoReticle=false # Rollback-only atlas renderer; false keeps the original Source DrawSelf reticle with native status/alpha
 ReticleDistanceScaling=true # Native reticle shrinks gently from 100% at 1m to 80% at 10m; false restores fixed size
