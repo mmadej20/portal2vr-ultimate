@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Check amazing job done by oxenar7 (https://github.com/oxenar7/portal2-vr-enriched) as continuation of this project!
+
 # Portal 2 VR
 
 An incremental modernization fork of [Gistix/portal2vr](https://github.com/Gistix/portal2vr), for the original Windows version of Portal 2. This remains a 32-bit Source/DX9 runtime-hooking mod, not a replacement engine or a rewrite. SteamVR / OpenVR and the modified DXVK rendering path are retained.
